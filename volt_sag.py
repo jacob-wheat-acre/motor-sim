@@ -89,20 +89,22 @@ def run(s: Scenario) -> None:
         i_lim_lv = s.vfd_i_limit_pu_fla * fla_lv
         i_lim_hv = i_lim_lv * (s.v_ll_lv / s.v_ll_hv)
 
-        # assume high displacement PF on front end; keep simple
+        # solve against local bus voltage phasor with current-limited input
         pf = 0.95
-        I_motor = complex(i_lim_hv * pf, -i_lim_hv * math.sqrt(1.0 - pf*pf))  # lagging current
-        # Capacitor adds leading reactive current: Icap = +j * Q/(3V)
-        # We'll approximate by subtracting Q from motor's reactive demand at nominal V:
-        Qm = abs(Vth_phase) * 3.0 * abs(I_motor) * math.sqrt(1.0 - pf*pf)  # crude
-        Qnet = max(Qm - Qcap_total_var, 0.0)
-        # rebuild I with same P but reduced Q (approx)
-        Pm = abs(Vth_phase) * 3.0 * abs(I_motor) * pf
-        Smag = math.sqrt(Pm*Pm + Qnet*Qnet)
-        Imag = Smag / (3.0 * abs(Vth_phase))
-        pf_new = Pm / max(Smag, 1e-9)
-        I = complex(Imag * pf_new, -Imag * math.sqrt(max(1.0 - pf_new*pf_new, 0.0)))
-        V_load = Vth_phase - Z_th * I
+        phi = math.acos(pf)
+        V = Vth_phase
+        for _ in range(80):
+            theta_v = cmath.phase(V)
+            I_motor = cmath.rect(i_lim_hv, theta_v - phi)
+            v_conj = V.conjugate() if abs(V) > 1e-9 else complex(1e-9, 0.0)
+            Icap = complex(0.0, +Qcap_phase_var) / v_conj
+            I_total = I_motor + Icap
+            V_new = Vth_phase - Z_th * I_total
+            if abs(V_new - V) / max(abs(V), 1e-9) < 1e-7:
+                V = V_new
+                break
+            V = V_new
+        V_load = V
 
     else:
         # ATL
@@ -170,20 +172,22 @@ def run_return(s: Scenario) -> tuple[float, float]:
         i_lim_lv = s.vfd_i_limit_pu_fla * fla_lv
         i_lim_hv = i_lim_lv * (s.v_ll_lv / s.v_ll_hv)
 
-        # assume high displacement PF on front end; keep simple
+        # solve against local bus voltage phasor with current-limited input
         pf = 0.95
-        I_motor = complex(i_lim_hv * pf, -i_lim_hv * math.sqrt(1.0 - pf*pf))  # lagging current
-        # Capacitor adds leading reactive current: Icap = +j * Q/(3V)
-        # We'll approximate by subtracting Q from motor's reactive demand at nominal V:
-        Qm = abs(Vth_phase) * 3.0 * abs(I_motor) * math.sqrt(1.0 - pf*pf)  # crude
-        Qnet = max(Qm - Qcap_total_var, 0.0)
-        # rebuild I with same P but reduced Q (approx)
-        Pm = abs(Vth_phase) * 3.0 * abs(I_motor) * pf
-        Smag = math.sqrt(Pm*Pm + Qnet*Qnet)
-        Imag = Smag / (3.0 * abs(Vth_phase))
-        pf_new = Pm / max(Smag, 1e-9)
-        I = complex(Imag * pf_new, -Imag * math.sqrt(max(1.0 - pf_new*pf_new, 0.0)))
-        V_load = Vth_phase - Z_th * I
+        phi = math.acos(pf)
+        V = Vth_phase
+        for _ in range(80):
+            theta_v = cmath.phase(V)
+            I_motor = cmath.rect(i_lim_hv, theta_v - phi)
+            v_conj = V.conjugate() if abs(V) > 1e-9 else complex(1e-9, 0.0)
+            Icap = complex(0.0, +Qcap_phase_var) / v_conj
+            I_total = I_motor + Icap
+            V_new = Vth_phase - Z_th * I_total
+            if abs(V_new - V) / max(abs(V), 1e-9) < 1e-7:
+                V = V_new
+                break
+            V = V_new
+        V_load = V
 
     else:
         # ATL

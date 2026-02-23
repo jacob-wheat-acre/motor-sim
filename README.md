@@ -54,8 +54,9 @@ Capacitor-bank convention used everywhere in this repo:
 
 Per-phase source impedance seen by the motor bus:
 
-- `Z_th = Z_line + Z_xfmr`
+- `Z_th = Z_upstream + Z_xfmr + Z_line`
 - `Z_line = miles * (R_cond + j X_cond)`
+- `Z_upstream = R_upstream + j X_upstream` (from utility short-circuit/Thevenin study, e.g., CAPE)
 
 Transformer impedance from nameplate `%Z` and `X/R`:
 
@@ -80,9 +81,14 @@ Core phasor equation:
 - `V_load = V_th - Z_th * I_total`
 
 The model computes `I_total` differently by start technology (below).  
-Voltage sag reported:
+Signed voltage change (sag/rise) reported:
 
 - `Sag_% = 100 * (1 - |V_load|/|V_th|)`
+
+Flicker screening metric:
+
+- `|ΔV|_% = abs(Sag_%)`
+- Limits are compared against `|ΔV|_%` (magnitude of rapid voltage change), not signed sag only.
 
 Approximate LV line-line voltage during the event:
 
@@ -117,8 +123,8 @@ VFD start is represented as current-limited with near-unity displacement PF:
 - `I_lim,LV = (vfd_i_limit_pu_fla) * FLA_LV`
 - `I_lim,HV = I_lim,LV * (V_LV,LL / V_HV,LL)`
 - `I_motor ~= I_lim,HV * (pf_vfd - j*sqrt(1-pf_vfd^2))`, with `pf_vfd ~ 0.95`
-
-Capacitor interaction is approximated by reducing net reactive demand before rebuilding current magnitude.
+- `I_cap = +j * Q_cap,phase,var / conj(V)`
+- Iterate `V_new = V_th - Z_th * (I_motor + I_cap)` to convergence
 
 ### 5) Flicker screening thresholds used
 
@@ -188,7 +194,13 @@ python3 motor_flicker_sweep.py --motor-hp 200 --miles 7 --start-tech ATL
 python3 motor_flicker_sweep.py --motor-hp 200 --miles 7 --start-tech SoftStart
 python3 motor_flicker_sweep.py --motor-hp 200 --miles 7 --start-tech VFD
 python3 motor_flicker_sweep.py --motor-hp 200 --miles 7 --start-tech ATL --cap-kvar 300
+python3 motor_flicker_sweep.py --motor-hp 5500 --miles 3 --start-tech VFD --cap-kvar 1200 --hp-max 7000
+python3 motor_flicker_sweep.py --motor-hp 5500 --miles 3 --start-tech VFD --cap-kvar 1200 --xfmr-kva 10000 --hp-max 10000
+python3 motor_flicker_sweep.py --motor-hp 5500 --miles 3 --start-tech VFD --cap-kvar 1200 --xfmr-kva 10000 --upstream-r-ohm 0.05 --upstream-x-ohm 0.35
 ```
+
+Note: default `--hp-max` is now `10000`, and you can raise/lower it for speed vs range.
+Note: default transformer is `500 kVA`; for multi-MW motors you should set `--xfmr-kva` (and optionally `--xfmr-pct-z`, `--xfmr-xr`) to realistic values.
 
 Interactive prompt mode:
 
@@ -202,6 +214,23 @@ In prompt mode, the script asks:
 - starting technology
 - whether a nearby capacitor bank is installed (`yes/no`)
 - capacitor-bank size in kVAr if installed
+- transformer kVA, %Z, and X/R
+- upstream Thevenin `R` and `X` (ohm/phase on MV side)
+
+Custom one-off study mode (recommended for a specific feeder build):
+
+```bash
+python3 motor_flicker_sweep.py --case-study
+# alias:
+python3 motor_flicker_sweep.py --study
+```
+
+In custom study mode, the script:
+- prompts for upstream `R`/`X`
+- prompts for miles of each conductor type in the library
+- computes total series line impedance from those segments
+- outputs a dedicated study figure vs flicker limits
+- prints an ASCII one-line model with your inputs and impedance breakdown
 
 ## How to make the charts less overwhelming
 
