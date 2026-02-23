@@ -16,6 +16,8 @@ from __future__ import annotations
 import argparse
 import cmath
 import math
+import platform
+import sys
 from dataclasses import replace
 from typing import Optional, List, Tuple
 
@@ -421,6 +423,15 @@ def prompt_yes_no(prompt: str, default_yes: bool = False) -> bool:
     return raw in ("y", "yes")
 
 
+def print_environment_info() -> None:
+    print("=== Environment ===")
+    print(f"Python: {sys.version.split()[0]}")
+    print(f"Platform: {platform.platform()}")
+    print(f"Executable: {sys.executable}")
+    print(f"NumPy: {np.__version__}")
+    print(f"Matplotlib: {plt.matplotlib.__version__}")
+
+
 def prompt_conductor_miles(conductor_variants: List[Tuple[str, Conductor]]) -> List[Tuple[str, Conductor, float]]:
     print("\nEnter segment miles by conductor type (press Enter for 0.0):")
     segments: List[Tuple[str, Conductor, float]] = []
@@ -624,7 +635,16 @@ def main():
         action="store_true",
         help="Alias for --case-study.",
     )
+    parser.add_argument(
+        "--print-env",
+        action="store_true",
+        help="Print Python/OS/package versions and exit.",
+    )
     args = parser.parse_args()
+
+    if args.print_env:
+        print_environment_info()
+        return
 
     # ---- sweep ranges for overview and screening interpolation ----
     hp_max = max(args.hp_max, 50.0)

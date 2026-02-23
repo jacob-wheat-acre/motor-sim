@@ -217,6 +217,24 @@ In prompt mode, the script asks:
 - transformer kVA, %Z, and X/R
 - upstream Thevenin `R` and `X` (ohm/phase on MV side)
 
+Environment consistency check:
+
+```bash
+python3 motor_flicker_sweep.py --print-env
+```
+
+To keep Mac and PC results aligned, use the pinned lock file:
+
+```bash
+python3 -m venv .venv
+# macOS:
+source .venv/bin/activate
+# Windows PowerShell:
+# .venv\\Scripts\\Activate.ps1
+pip install -r requirements-lock.txt
+python motor_flicker_sweep.py --print-env
+```
+
 Custom one-off study mode (recommended for a specific feeder build):
 
 ```bash
