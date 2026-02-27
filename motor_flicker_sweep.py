@@ -52,7 +52,7 @@ CONDUCTOR_VARIANTS: List[Tuple[str, Conductor]] = [
 # MV column summary (conservative choices):
 #   N <= 4 per day: 5% (table shows 5–6%; use 5 for conservative)
 #   N <= 2 per hour: 4%
-#   2 < N <= 10 per hour: 3%
+#   2 < N <= 10 per hour: 4%
 # -----------------------------
 def allowable_dv_percent_mv(
     starts_per_hour: float,
@@ -70,10 +70,10 @@ def allowable_dv_percent_mv(
     if starts_per_hour <= 2.0:
         return 4.0
     if starts_per_hour <= 10.0:
-        return 3.0
+        return 4.0
 
-    # Beyond 10/hr: already deep flicker territory; hold conservative at 3%
-    return 3.0
+    # Beyond 10/hr: hold conservative at the 4% screening criterion.
+    return 4.0
 
 
 # -----------------------------
