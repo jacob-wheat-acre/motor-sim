@@ -15,10 +15,10 @@ This repo simulates voltage sag and power-quality effects during motor starting 
 
 Main files:
 
-- `/Users/jacob/Code/motor-sim/volt_sag.py`: core 2-bus sag model and scenario definitions
-- `/Users/jacob/Code/motor-sim/motor_flicker_sweep.py`: HP/miles sweeps with two focused plotting modes
-- `/Users/jacob/Code/motor-sim/motor_start_sim.py`: dynamic-ish motor startup model
-- `/Users/jacob/Code/motor-sim/vfd_harmonics_demo.py`: 6-pulse front-end harmonic demo
+- `volt_sag.py`: core 2-bus sag model and scenario definitions
+- `motor_flicker_sweep.py`: HP/miles sweeps with two focused plotting modes
+- `motor_start_sim.py`: dynamic-ish motor startup model
+- `vfd_harmonics_demo.py`: 6-pulse front-end harmonic demo
 
 ## Conductor impedance values used
 
@@ -178,7 +178,7 @@ How it impacts equations:
 
 ## Run
 
-From `/Users/jacob/Code/motor-sim`:
+From the repo root:
 
 ```bash
 python3 motor_flicker_sweep.py

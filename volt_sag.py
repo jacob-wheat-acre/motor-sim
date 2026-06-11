@@ -72,15 +72,8 @@ def two_bus_solve_constS(Vth_phase: complex, Zth: complex, S3: complex, max_iter
         V = V_new
     return V
 
-def run(s: Scenario) -> None:
-    # Build Thevenin impedance on HV side
-    Z_line = complex(s.cond.r_ohm_per_mile * s.miles, s.cond.x_ohm_per_mile * s.miles)
-    Z_xfmr = z_from_pctz(s.v_ll_hv, s.xfmr_kva, s.xfmr_pct_z, s.xfmr_x_over_r)
-    Z_th = Z_line + Z_xfmr
-
-    Vth_phase = complex(s.v_ll_hv / SQRT3, 0.0)
-
-    # Capacitor bank input is 3-phase total kVAr at the load bus.
+def _solve_load_voltage(s: Scenario, Z_th: complex, Vth_phase: complex) -> complex:
+    """Solve load bus voltage for a given Thevenin equivalent and scenario."""
     Qcap_total_var = s.cap_kvar * 1000.0
     Qcap_phase_var = Qcap_total_var / 3.0
 
@@ -88,8 +81,6 @@ def run(s: Scenario) -> None:
         fla_lv = estimate_fla(s.hp, s.v_ll_lv, s.run_eff, s.run_pf)
         i_lim_lv = s.vfd_i_limit_pu_fla * fla_lv
         i_lim_hv = i_lim_lv * (s.v_ll_lv / s.v_ll_hv)
-
-        # solve against local bus voltage phasor with current-limited input
         pf = 0.95
         phi = math.acos(pf)
         V = Vth_phase
@@ -104,45 +95,43 @@ def run(s: Scenario) -> None:
                 V = V_new
                 break
             V = V_new
-        V_load = V
+        return V
 
-    else:
-        # ATL
-        S_lr_kva = locked_rotor_kva(s.hp, s.motor_code)
+    S_lr_kva = locked_rotor_kva(s.hp, s.motor_code)
 
-        if s.atl_model.upper() == "CONST_S":
-            S = S_lr_kva * 1000.0
-            P = S * s.start_pf
-            Q = math.sqrt(max(S*S - P*P, 0.0))
-            # subtract cap vars
-            Q_net = Q - Qcap_total_var
-            S3 = complex(P, Q_net)
-            V_load = two_bus_solve_constS(Vth_phase, Z_th, S3)
+    if s.atl_model.upper() == "CONST_S":
+        S = S_lr_kva * 1000.0
+        P = S * s.start_pf
+        Q = math.sqrt(max(S * S - P * P, 0.0))
+        Q_net = Q - Qcap_total_var
+        S3 = complex(P, Q_net)
+        return two_bus_solve_constS(Vth_phase, Z_th, S3)
 
-        elif s.atl_model.upper() == "CONST_I":
-            # Compute LRA current on HV side from locked-rotor kVA
-            I_lra_hv = (S_lr_kva * 1000.0) / (SQRT3 * s.v_ll_hv)
-            I_mag = s.atl_I_multiplier_of_LRA * I_lra_hv
-
-            # Assume LRA PF (lagging). Start PF commonly 0.15–0.35; keep start_pf for angle.
-            pf = s.start_pf
-            I_motor = complex(I_mag * pf, -I_mag * math.sqrt(max(1.0 - pf*pf, 0.0)))
-
-            # Capacitor current at the *load* bus depends on voltage: Icap = +j Qcap / (3 V*)
-            # We'll iterate a couple times: V -> Icap -> V
-            V = Vth_phase
-            for _ in range(50):
-                Icap = complex(0.0, +Qcap_phase_var / max(abs(V), 1e-9))  # leading (+j)
-                I_total = I_motor + Icap  # net current drawn from source
-                V_new = Vth_phase - Z_th * I_total
-                if abs(V_new - V) / max(abs(V), 1e-9) < 1e-6:
-                    V = V_new
-                    break
+    if s.atl_model.upper() == "CONST_I":
+        I_lra_hv = (S_lr_kva * 1000.0) / (SQRT3 * s.v_ll_hv)
+        I_mag = s.atl_I_multiplier_of_LRA * I_lra_hv
+        pf = s.start_pf
+        I_motor = complex(I_mag * pf, -I_mag * math.sqrt(max(1.0 - pf * pf, 0.0)))
+        V = Vth_phase
+        for _ in range(50):
+            Icap = complex(0.0, +Qcap_phase_var / max(abs(V), 1e-9))
+            I_total = I_motor + Icap
+            V_new = Vth_phase - Z_th * I_total
+            if abs(V_new - V) / max(abs(V), 1e-9) < 1e-6:
                 V = V_new
+                break
+            V = V_new
+        return V
 
-            V_load = V
-        else:
-            raise ValueError("atl_model must be CONST_S or CONST_I")
+    raise ValueError("atl_model must be CONST_S or CONST_I")
+
+def run(s: Scenario, z_upstream_phase: complex = 0j) -> None:
+    Z_line = complex(s.cond.r_ohm_per_mile * s.miles, s.cond.x_ohm_per_mile * s.miles)
+    Z_xfmr = z_from_pctz(s.v_ll_hv, s.xfmr_kva, s.xfmr_pct_z, s.xfmr_x_over_r)
+    Z_th = z_upstream_phase + Z_line + Z_xfmr
+    Vth_phase = complex(s.v_ll_hv / SQRT3, 0.0)
+
+    V_load = _solve_load_voltage(s, Z_th, Vth_phase)
 
     sag_pct = 100.0 * (1.0 - abs(V_load) / abs(Vth_phase))
     v_lv_ll = abs(V_load) * SQRT3 * (s.v_ll_lv / s.v_ll_hv)
@@ -155,83 +144,17 @@ def run(s: Scenario) -> None:
     print(f"Approx LV during event: ~{v_lv_ll:.0f} V LL")
     print()
 
-def run_return(s: Scenario) -> tuple[float, float]:
-    # Build Thevenin impedance on HV side
+def run_return(s: Scenario, z_upstream_phase: complex = 0j) -> tuple[float, float]:
     Z_line = complex(s.cond.r_ohm_per_mile * s.miles, s.cond.x_ohm_per_mile * s.miles)
     Z_xfmr = z_from_pctz(s.v_ll_hv, s.xfmr_kva, s.xfmr_pct_z, s.xfmr_x_over_r)
-    Z_th = Z_line + Z_xfmr
-
+    Z_th = z_upstream_phase + Z_line + Z_xfmr
     Vth_phase = complex(s.v_ll_hv / SQRT3, 0.0)
 
-    # Capacitor bank input is 3-phase total kVAr at the load bus.
-    Qcap_total_var = s.cap_kvar * 1000.0
-    Qcap_phase_var = Qcap_total_var / 3.0
-
-    if s.start_mode.upper() == "VFD":
-        fla_lv = estimate_fla(s.hp, s.v_ll_lv, s.run_eff, s.run_pf)
-        i_lim_lv = s.vfd_i_limit_pu_fla * fla_lv
-        i_lim_hv = i_lim_lv * (s.v_ll_lv / s.v_ll_hv)
-
-        # solve against local bus voltage phasor with current-limited input
-        pf = 0.95
-        phi = math.acos(pf)
-        V = Vth_phase
-        for _ in range(80):
-            theta_v = cmath.phase(V)
-            I_motor = cmath.rect(i_lim_hv, theta_v - phi)
-            v_conj = V.conjugate() if abs(V) > 1e-9 else complex(1e-9, 0.0)
-            Icap = complex(0.0, +Qcap_phase_var) / v_conj
-            I_total = I_motor + Icap
-            V_new = Vth_phase - Z_th * I_total
-            if abs(V_new - V) / max(abs(V), 1e-9) < 1e-7:
-                V = V_new
-                break
-            V = V_new
-        V_load = V
-
-    else:
-        # ATL
-        S_lr_kva = locked_rotor_kva(s.hp, s.motor_code)
-
-        if s.atl_model.upper() == "CONST_S":
-            S = S_lr_kva * 1000.0
-            P = S * s.start_pf
-            Q = math.sqrt(max(S*S - P*P, 0.0))
-            # subtract cap vars
-            Q_net = Q - Qcap_total_var
-            S3 = complex(P, Q_net)
-            V_load = two_bus_solve_constS(Vth_phase, Z_th, S3)
-
-        elif s.atl_model.upper() == "CONST_I":
-            # Compute LRA current on HV side from locked-rotor kVA
-            I_lra_hv = (S_lr_kva * 1000.0) / (SQRT3 * s.v_ll_hv)
-            I_mag = s.atl_I_multiplier_of_LRA * I_lra_hv
-
-            # Assume LRA PF (lagging). Start PF commonly 0.15–0.35; keep start_pf for angle.
-            pf = s.start_pf
-            I_motor = complex(I_mag * pf, -I_mag * math.sqrt(max(1.0 - pf*pf, 0.0)))
-
-            # Capacitor current at the *load* bus depends on voltage: Icap = +j Qcap / (3 V*)
-            # We'll iterate a couple times: V -> Icap -> V
-            V = Vth_phase
-            for _ in range(50):
-                Icap = complex(0.0, +Qcap_phase_var / max(abs(V), 1e-9))  # leading (+j)
-                I_total = I_motor + Icap  # net current drawn from source
-                V_new = Vth_phase - Z_th * I_total
-                if abs(V_new - V) / max(abs(V), 1e-9) < 1e-6:
-                    V = V_new
-                    break
-                V = V_new
-
-            V_load = V
-        else:
-            raise ValueError("atl_model must be CONST_S or CONST_I")
+    V_load = _solve_load_voltage(s, Z_th, Vth_phase)
 
     sag_pct = 100.0 * (1.0 - abs(V_load) / abs(Vth_phase))
     v_lv_ll = abs(V_load) * SQRT3 * (s.v_ll_lv / s.v_ll_hv)
-
     return sag_pct, v_lv_ll
-    pass
 
 def trade_sweep():
     base = Scenario()
@@ -280,17 +203,14 @@ def trade_sweep():
                 print(f"{case:>4} | {kva:>8} | {pctz:>3.2f} | {label:<9} | {sag:>5.1f} | {vll:>7.0f}")
                 case += 1
 
+
 if __name__ == "__main__":
     trade_sweep()
 
-
-if __name__ == "__main__":
     sc = Scenario()
-    # Recommended: ATL as CONST_I for meaningful sags
     sc.start_mode = "ATL"
     sc.atl_model = "CONST_I"
     sc.start_pf = 0.25
-
     for cap in [0, 300, 600, 900, 1200, 1500]:
         sc.cap_kvar = cap
         run(sc)
