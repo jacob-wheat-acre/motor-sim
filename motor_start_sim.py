@@ -424,17 +424,27 @@ def plot_results(results, title):
 
 
 if __name__ == "__main__":
-    mp = MotorParams()
+    import argparse
 
-    # "Weak-ish" feeder on 480 V side (tune to taste)
+    parser = argparse.ArgumentParser(description="Motor startup dynamic simulation (ATL / soft-start / VFD).")
+    parser.add_argument("--hp",        type=float, default=300.0,  help="Motor nameplate HP.")
+    parser.add_argument("--modes",     nargs="+",  default=["ATL", "SOFT", "VFD"],
+                        choices=["ATL", "SOFT", "VFD"], metavar="MODE",
+                        help="Start mode(s) to simulate (default: ATL SOFT VFD).")
+    parser.add_argument("--load",      type=str,   default="CENTRIFUGAL",
+                        choices=["CENTRIFUGAL", "CONSTANT"],
+                        help="Load torque characteristic.")
+    parser.add_argument("--feeder-r",  type=float, default=0.010,  help="Feeder Thevenin R (ohm/phase, 480 V side).")
+    parser.add_argument("--feeder-x",  type=float, default=0.060,  help="Feeder Thevenin X (ohm/phase, 480 V side).")
+    parser.add_argument("--t-end",     type=float, default=8.0,    help="Simulation end time (s).")
+    args = parser.parse_args()
+
+    mp = MotorParams(hp=args.hp)
     feeder = FeederThevenin(
         v_ll=mp.v_ll_base,
-        z_th_phase=complex(0.010, 0.060)
+        z_th_phase=complex(args.feeder_r, args.feeder_x),
     )
-
-    # Change to LoadParams(kind="CONSTANT") for constant-torque load
-    lp = LoadParams(kind="CENTRIFUGAL", T_rated_pu=1.0)
-
+    lp = LoadParams(kind=args.load, T_rated_pu=1.0)
     vfd_ctrl = VFDControlParams(
         w_ref_ramp_time=4.0,
         kp=8.0,
@@ -444,10 +454,10 @@ if __name__ == "__main__":
         i_flux_pu=0.35,
         pf_assumed=0.98,
         f_min_hz=5.0,
-        slip_frac_at_rated_torque=0.03
+        slip_frac_at_rated_torque=0.03,
     )
 
-    for mode in ["ATL", "SOFT", "VFD"]:
-        sp = StartProfile(mode=mode)
+    for mode in args.modes:
+        sp = StartProfile(mode=mode, t_end=args.t_end)
         res = simulate(mp, feeder, sp, lp, vfd=vfd_ctrl)
         plot_results(res, f"{mode} start ({lp.kind.lower()} load)")

@@ -4,21 +4,40 @@ from dataclasses import dataclass, field
 
 SQRT3 = math.sqrt(3.0)
 
+# NEMA MG1 Table 10.37.2 — locked-rotor kVA per HP bands
 NEMA_KVA_PER_HP = {
-    "G": (5.6, 6.29),
-    "H": (6.3, 7.09),
-    "J": (7.1, 7.99),
-    "K": (8.0, 8.99),
+    "A": (0.00,  3.14),
+    "B": (3.15,  3.54),
+    "C": (3.55,  3.99),
+    "D": (4.00,  4.49),
+    "E": (4.50,  4.99),
+    "F": (5.00,  5.59),
+    "G": (5.60,  6.29),
+    "H": (6.30,  7.09),
+    "J": (7.10,  7.99),
+    "K": (8.00,  8.99),
+    "L": (9.00,  9.99),
+    "M": (10.00, 11.19),
+    "N": (11.20, 12.49),
+    "P": (12.50, 13.99),
+    "R": (14.00, 15.99),
+    "S": (16.00, 17.99),
+    "T": (18.00, 19.99),
+    "U": (20.00, 22.39),
+    "V": (22.40, 25.00),  # "22.4 and up"; 25 used as upper bound for midpoint
 }
+
 
 def locked_rotor_kva(hp: float, code_letter: str) -> float:
     lo, hi = NEMA_KVA_PER_HP[code_letter.upper()]
     return hp * 0.5 * (lo + hi)
 
+
 @dataclass(frozen=True)
 class Conductor:
     r_ohm_per_mile: float
     x_ohm_per_mile: float
+
 
 @dataclass
 class Scenario:
@@ -36,18 +55,20 @@ class Scenario:
     xfmr_x_over_r: float = 10.0
 
     # Start representation
-    start_mode: str = "ATL"         # "ATL" or "VFD"
-    atl_model: str = "CONST_I"      # "CONST_I" (recommended) or "CONST_S"
-    start_pf: float = 0.25          # used only for CONST_S
-    atl_I_multiplier_of_LRA: float = 1.0  # for CONST_I; 1.0 = LRA magnitude
+    start_mode: str = "ATL"               # "ATL" or "VFD"
+    atl_model: str = "CONST_I"            # "CONST_I" (recommended) or "CONST_S"
+    start_pf: float = 0.25                # lagging PF during ATL locked-rotor
+    atl_I_multiplier_of_LRA: float = 1.0  # 1.0 = full LRA; <1 for soft-start reduction
 
     # VFD representation
     vfd_i_limit_pu_fla: float = 1.30
+    vfd_start_pf: float = 0.95   # displacement PF assumed at VFD input during start
     run_eff: float = 0.95
     run_pf: float = 0.90
 
     # Capacitor bank (3φ total kVAr at the load bus)
     cap_kvar: float = 0.0
+
 
 def z_from_pctz(v_ll: float, s_kva: float, pct_z: float, x_over_r: float) -> complex:
     z_base = (v_ll ** 2) / (s_kva * 1000.0)
@@ -56,11 +77,13 @@ def z_from_pctz(v_ll: float, s_kva: float, pct_z: float, x_over_r: float) -> com
     x = r * x_over_r
     return complex(r, x)
 
+
 def estimate_fla(hp: float, v_ll: float, eff: float, pf: float) -> float:
     p_out = hp * 746.0
     p_in = p_out / max(eff, 1e-9)
     s_va = p_in / max(pf, 1e-9)
     return s_va / (SQRT3 * v_ll)
+
 
 def two_bus_solve_constS(Vth_phase: complex, Zth: complex, S3: complex, max_iter=200, tol=1e-6) -> complex:
     V = Vth_phase
@@ -72,25 +95,35 @@ def two_bus_solve_constS(Vth_phase: complex, Zth: complex, S3: complex, max_iter
         V = V_new
     return V
 
-def _solve_load_voltage(s: Scenario, Z_th: complex, Vth_phase: complex) -> complex:
-    """Solve load bus voltage for a given Thevenin equivalent and scenario."""
+
+def solve_load_voltage(
+    s: Scenario,
+    Z_th: complex,
+    Vth_phase: complex,
+    i_start_limit_hv: float = math.inf,
+) -> complex:
+    """
+    Solve load bus voltage for a given Thevenin equivalent and scenario.
+
+    i_start_limit_hv: optional startup kVA cap expressed as HV-side amps.
+    When finite, the motor start current is clamped to this limit before
+    the voltage is solved (mirrors utility startup-kVA cap requirements).
+    """
     Qcap_total_var = s.cap_kvar * 1000.0
     Qcap_phase_var = Qcap_total_var / 3.0
 
     if s.start_mode.upper() == "VFD":
         fla_lv = estimate_fla(s.hp, s.v_ll_lv, s.run_eff, s.run_pf)
         i_lim_lv = s.vfd_i_limit_pu_fla * fla_lv
-        i_lim_hv = i_lim_lv * (s.v_ll_lv / s.v_ll_hv)
-        pf = 0.95
-        phi = math.acos(pf)
+        i_lim_hv = min(i_lim_lv * (s.v_ll_lv / s.v_ll_hv), i_start_limit_hv)
+        phi = math.acos(min(max(s.vfd_start_pf, 0.0), 1.0))
         V = Vth_phase
         for _ in range(80):
             theta_v = cmath.phase(V)
             I_motor = cmath.rect(i_lim_hv, theta_v - phi)
             v_conj = V.conjugate() if abs(V) > 1e-9 else complex(1e-9, 0.0)
             Icap = complex(0.0, +Qcap_phase_var) / v_conj
-            I_total = I_motor + Icap
-            V_new = Vth_phase - Z_th * I_total
+            V_new = Vth_phase - Z_th * (I_motor + Icap)
             if abs(V_new - V) / max(abs(V), 1e-9) < 1e-7:
                 V = V_new
                 break
@@ -101,22 +134,22 @@ def _solve_load_voltage(s: Scenario, Z_th: complex, Vth_phase: complex) -> compl
 
     if s.atl_model.upper() == "CONST_S":
         S = S_lr_kva * 1000.0
+        if math.isfinite(i_start_limit_hv):
+            S = min(S, SQRT3 * s.v_ll_hv * i_start_limit_hv)
         P = S * s.start_pf
         Q = math.sqrt(max(S * S - P * P, 0.0))
-        Q_net = Q - Qcap_total_var
-        S3 = complex(P, Q_net)
+        S3 = complex(P, Q - Qcap_total_var)
         return two_bus_solve_constS(Vth_phase, Z_th, S3)
 
     if s.atl_model.upper() == "CONST_I":
         I_lra_hv = (S_lr_kva * 1000.0) / (SQRT3 * s.v_ll_hv)
-        I_mag = s.atl_I_multiplier_of_LRA * I_lra_hv
+        I_mag = min(s.atl_I_multiplier_of_LRA * I_lra_hv, i_start_limit_hv)
         pf = s.start_pf
         I_motor = complex(I_mag * pf, -I_mag * math.sqrt(max(1.0 - pf * pf, 0.0)))
         V = Vth_phase
         for _ in range(50):
             Icap = complex(0.0, +Qcap_phase_var / max(abs(V), 1e-9))
-            I_total = I_motor + Icap
-            V_new = Vth_phase - Z_th * I_total
+            V_new = Vth_phase - Z_th * (I_motor + Icap)
             if abs(V_new - V) / max(abs(V), 1e-9) < 1e-6:
                 V = V_new
                 break
@@ -125,13 +158,14 @@ def _solve_load_voltage(s: Scenario, Z_th: complex, Vth_phase: complex) -> compl
 
     raise ValueError("atl_model must be CONST_S or CONST_I")
 
+
 def run(s: Scenario, z_upstream_phase: complex = 0j) -> None:
     Z_line = complex(s.cond.r_ohm_per_mile * s.miles, s.cond.x_ohm_per_mile * s.miles)
     Z_xfmr = z_from_pctz(s.v_ll_hv, s.xfmr_kva, s.xfmr_pct_z, s.xfmr_x_over_r)
     Z_th = z_upstream_phase + Z_line + Z_xfmr
     Vth_phase = complex(s.v_ll_hv / SQRT3, 0.0)
 
-    V_load = _solve_load_voltage(s, Z_th, Vth_phase)
+    V_load = solve_load_voltage(s, Z_th, Vth_phase)
 
     sag_pct = 100.0 * (1.0 - abs(V_load) / abs(Vth_phase))
     v_lv_ll = abs(V_load) * SQRT3 * (s.v_ll_lv / s.v_ll_hv)
@@ -144,17 +178,19 @@ def run(s: Scenario, z_upstream_phase: complex = 0j) -> None:
     print(f"Approx LV during event: ~{v_lv_ll:.0f} V LL")
     print()
 
+
 def run_return(s: Scenario, z_upstream_phase: complex = 0j) -> tuple[float, float]:
     Z_line = complex(s.cond.r_ohm_per_mile * s.miles, s.cond.x_ohm_per_mile * s.miles)
     Z_xfmr = z_from_pctz(s.v_ll_hv, s.xfmr_kva, s.xfmr_pct_z, s.xfmr_x_over_r)
     Z_th = z_upstream_phase + Z_line + Z_xfmr
     Vth_phase = complex(s.v_ll_hv / SQRT3, 0.0)
 
-    V_load = _solve_load_voltage(s, Z_th, Vth_phase)
+    V_load = solve_load_voltage(s, Z_th, Vth_phase)
 
     sag_pct = 100.0 * (1.0 - abs(V_load) / abs(Vth_phase))
     v_lv_ll = abs(V_load) * SQRT3 * (s.v_ll_lv / s.v_ll_hv)
     return sag_pct, v_lv_ll
+
 
 def trade_sweep():
     base = Scenario()
@@ -163,22 +199,18 @@ def trade_sweep():
     base.start_pf = 0.25
     base.cap_kvar = 0.0
 
-    # Candidate transformer sizes and %Z
     xfmr_kvas = [500, 750, 1000, 1500, 2000]
     pctzs = [4.5, 5.0, 5.75, 6.5]
-
-    # Conductor options as (label, R, X)
-    # Put real values here as you like. For now, include a couple rough upgrades.
     conductors = [
-        ("#2 ACSR", 1.367, 0.581),
-        ("1/0 ACSR", 0.86, 0.50),
-        ("4/0 ACSR", 0.43, 0.45),
-        ("336 ACSR", 0.27, 0.40),
+        ("#2 ACSR",  1.367, 0.581),
+        ("1/0 ACSR", 0.86,  0.50),
+        ("4/0 ACSR", 0.43,  0.45),
+        ("336 ACSR", 0.27,  0.40),
     ]
 
     print("=== Trade sweep: transformer vs reconductor (ATL CONST_I) ===")
     print("Case | xfmr_kVA | %Z | conductor | sag% | LV_LL_V")
-    print("-"*72)
+    print("-" * 72)
 
     case = 1
     for label, r, x in conductors:
@@ -197,7 +229,7 @@ def trade_sweep():
                     start_mode=base.start_mode,
                     atl_model=base.atl_model,
                     start_pf=base.start_pf,
-                    cap_kvar=base.cap_kvar
+                    cap_kvar=base.cap_kvar,
                 )
                 sag, vll = run_return(sc)
                 print(f"{case:>4} | {kva:>8} | {pctz:>3.2f} | {label:<9} | {sag:>5.1f} | {vll:>7.0f}")

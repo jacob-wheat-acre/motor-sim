@@ -6,15 +6,16 @@ Sweep motor HP vs feeder miles and plot:
   - predicted sag (%ΔV/V) during start (from volt_sag Scenario model)
   - "risk" relative to Xcel MV rapid voltage change limit (step-change table)
 
-Provides two plotting modes:
+Provides three plotting modes:
   - overview_mode(): one HP-vs-miles heatmap + risk overlay
   - compare_mode(): one selected point + conductor bar chart + ranked table
+  - custom_study_mode(): one custom feeder build (segment miles + upstream Z)
 """
 
 from __future__ import annotations
 
 import argparse
-import cmath
+import csv
 import math
 import platform
 import sys
@@ -43,8 +44,8 @@ CONDUCTOR_VARIANTS: List[Tuple[str, Conductor, float]] = [
     ("795 ACSR", Conductor(0.119, 0.412), 900.0),
     ("336 ACSR", Conductor(0.276, 0.463), 530.0),
     ("2/0 ACSR", Conductor(0.686, 0.537), 300.0),
-    ("#2 ACSR", Conductor(1.367, 0.581), 190.0),
-    ("#4 ACSR", Conductor(2.175, 0.608), 150.0),
+    ("#2 ACSR",  Conductor(1.367, 0.581), 190.0),
+    ("#4 ACSR",  Conductor(2.175, 0.608), 150.0),
 ]
 
 
@@ -62,108 +63,44 @@ def allowable_dv_percent_mv(
 ) -> float:
     if starts_per_day is None:
         starts_per_day = starts_per_hour * 24.0
-
-    # Infrequent events: allow daily row
     if starts_per_day <= 4.0:
         return conservative_daily_pct
-
-    # Otherwise use hourly rows
-    if starts_per_hour <= 2.0:
-        return 4.0
     if starts_per_hour <= 10.0:
         return 4.0
-
-    # Beyond 10/hr: hold conservative at the 4% screening criterion.
     return 4.0
 
 
-# -----------------------------
-# Compute sag % using the same math as volt_sag.run(), but return a number.
-# -----------------------------
+def _thevenin(
+    s: Scenario,
+    z_line_override: Optional[complex],
+    z_upstream_phase: complex,
+) -> Tuple[complex, complex]:
+    """Return (Z_th, Vth_phase) for a scenario."""
+    Z_line = (
+        z_line_override
+        if z_line_override is not None
+        else complex(s.cond.r_ohm_per_mile * s.miles, s.cond.x_ohm_per_mile * s.miles)
+    )
+    Z_xfmr = volt_sag.z_from_pctz(s.v_ll_hv, s.xfmr_kva, s.xfmr_pct_z, s.xfmr_x_over_r)
+    Z_th = z_upstream_phase + Z_line + Z_xfmr
+    Vth_phase = complex(s.v_ll_hv / volt_sag.SQRT3, 0.0)
+    return Z_th, Vth_phase
+
+
+def _i_start_limit(s: Scenario, max_start_kva: Optional[float]) -> float:
+    if max_start_kva is not None and max_start_kva > 0.0:
+        return (max_start_kva * 1000.0) / (volt_sag.SQRT3 * s.v_ll_hv)
+    return math.inf
+
+
 def sag_percent(
     s: Scenario,
     z_line_override: Optional[complex] = None,
     z_upstream_phase: complex = 0j,
     max_start_kva: Optional[float] = None,
 ) -> float:
-    # Thevenin impedance on HV side
-    Z_line = z_line_override if z_line_override is not None else complex(s.cond.r_ohm_per_mile * s.miles, s.cond.x_ohm_per_mile * s.miles)
-    Z_xfmr = volt_sag.z_from_pctz(s.v_ll_hv, s.xfmr_kva, s.xfmr_pct_z, s.xfmr_x_over_r)
-    Z_th = z_upstream_phase + Z_line + Z_xfmr
-
-    Vth_phase = complex(s.v_ll_hv / volt_sag.SQRT3, 0.0)
-
-    # Capacitor bank input is 3-phase total kVAr at the load bus.
-    Qcap_total_var = s.cap_kvar * 1000.0
-    Qcap_phase_var = Qcap_total_var / 3.0
-
-    i_start_limit_hv = math.inf
-    if max_start_kva is not None and max_start_kva > 0.0:
-        i_start_limit_hv = (max_start_kva * 1000.0) / (volt_sag.SQRT3 * s.v_ll_hv)
-
-    if s.start_mode.upper() == "VFD":
-        fla_lv = volt_sag.estimate_fla(s.hp, s.v_ll_lv, s.run_eff, s.run_pf)
-        i_lim_lv = s.vfd_i_limit_pu_fla * fla_lv
-        i_lim_hv = i_lim_lv * (s.v_ll_lv / s.v_ll_hv)
-        i_lim_hv = min(i_lim_hv, i_start_limit_hv)
-
-        # Solve VFD input current against local bus voltage phasor:
-        # - motor current magnitude limited by VFD current limit
-        # - motor displacement PF assumed near-unity but lagging
-        # - capacitor current computed from local phasor voltage
-        pf = 0.95
-        phi = math.acos(pf)
-        V = Vth_phase
-        for _ in range(80):
-            theta_v = cmath.phase(V)
-            I_motor = cmath.rect(i_lim_hv, theta_v - phi)
-            v_conj = V.conjugate() if abs(V) > 1e-9 else complex(1e-9, 0.0)
-            Icap = complex(0.0, +Qcap_phase_var) / v_conj
-            I_total = I_motor + Icap
-            V_new = Vth_phase - Z_th * I_total
-            if abs(V_new - V) / max(abs(V), 1e-9) < 1e-7:
-                V = V_new
-                break
-            V = V_new
-        V_load = V
-
-    else:
-        # ATL
-        S_lr_kva = volt_sag.locked_rotor_kva(s.hp, s.motor_code)
-
-        if s.atl_model.upper() == "CONST_S":
-            S = S_lr_kva * 1000.0
-            if math.isfinite(i_start_limit_hv):
-                s_limit_va = volt_sag.SQRT3 * s.v_ll_hv * i_start_limit_hv
-                S = min(S, s_limit_va)
-            P = S * s.start_pf
-            Q = math.sqrt(max(S * S - P * P, 0.0))
-            Q_net = Q - Qcap_total_var
-            S3 = complex(P, Q_net)
-            V_load = volt_sag.two_bus_solve_constS(Vth_phase, Z_th, S3)
-
-        elif s.atl_model.upper() == "CONST_I":
-            I_lra_hv = (S_lr_kva * 1000.0) / (volt_sag.SQRT3 * s.v_ll_hv)
-            I_mag = s.atl_I_multiplier_of_LRA * I_lra_hv
-            I_mag = min(I_mag, i_start_limit_hv)
-
-            pf = s.start_pf
-            I_motor = complex(I_mag * pf, -I_mag * math.sqrt(max(1.0 - pf * pf, 0.0)))
-
-            V = Vth_phase
-            for _ in range(60):
-                Icap = complex(0.0, +Qcap_phase_var / max(abs(V), 1e-9))
-                I_total = I_motor + Icap
-                V_new = Vth_phase - Z_th * I_total
-                if abs(V_new - V) / max(abs(V), 1e-9) < 1e-7:
-                    V = V_new
-                    break
-                V = V_new
-            V_load = V
-
-        else:
-            raise ValueError("atl_model must be CONST_S or CONST_I")
-
+    Z_th, Vth_phase = _thevenin(s, z_line_override, z_upstream_phase)
+    V_load = volt_sag.solve_load_voltage(s, Z_th, Vth_phase, _i_start_limit(s, max_start_kva))
     return 100.0 * (1.0 - abs(V_load) / abs(Vth_phase))
 
 
@@ -173,16 +110,10 @@ def start_and_run_current_hv_amps(
     z_upstream_phase: complex = 0j,
     max_start_kva: Optional[float] = None,
 ) -> Tuple[float, float]:
-    # Thevenin impedance on HV side
-    Z_line = z_line_override if z_line_override is not None else complex(s.cond.r_ohm_per_mile * s.miles, s.cond.x_ohm_per_mile * s.miles)
-    Z_xfmr = volt_sag.z_from_pctz(s.v_ll_hv, s.xfmr_kva, s.xfmr_pct_z, s.xfmr_x_over_r)
-    Z_th = z_upstream_phase + Z_line + Z_xfmr
+    Z_th, Vth_phase = _thevenin(s, z_line_override, z_upstream_phase)
+    Qcap_phase_var = (s.cap_kvar * 1000.0) / 3.0
 
-    Vth_phase = complex(s.v_ll_hv / volt_sag.SQRT3, 0.0)
-    Qcap_total_var = s.cap_kvar * 1000.0
-    Qcap_phase_var = Qcap_total_var / 3.0
-
-    # Running current estimate on HV side (includes capacitor effect at nominal voltage).
+    # Running current at nominal voltage (no transient solve needed)
     fla_lv = volt_sag.estimate_fla(s.hp, s.v_ll_lv, s.run_eff, s.run_pf)
     i_run_motor_hv = fla_lv * (s.v_ll_lv / s.v_ll_hv)
     run_pf = min(max(s.run_pf, 0.0), 1.0)
@@ -193,61 +124,9 @@ def start_and_run_current_hv_amps(
     Icap_run = complex(0.0, +Qcap_phase_var / max(abs(Vth_phase), 1e-9))
     run_current_hv = abs(I_run_motor + Icap_run)
 
-    i_start_limit_hv = math.inf
-    if max_start_kva is not None and max_start_kva > 0.0:
-        i_start_limit_hv = (max_start_kva * 1000.0) / (volt_sag.SQRT3 * s.v_ll_hv)
-
-    if s.start_mode.upper() == "VFD":
-        i_lim_lv = s.vfd_i_limit_pu_fla * fla_lv
-        i_lim_hv = i_lim_lv * (s.v_ll_lv / s.v_ll_hv)
-        i_lim_hv = min(i_lim_hv, i_start_limit_hv)
-        pf = 0.95
-        phi = math.acos(pf)
-        V = Vth_phase
-        I_total = 0j
-        for _ in range(80):
-            theta_v = cmath.phase(V)
-            I_motor = cmath.rect(i_lim_hv, theta_v - phi)
-            v_conj = V.conjugate() if abs(V) > 1e-9 else complex(1e-9, 0.0)
-            Icap = complex(0.0, +Qcap_phase_var) / v_conj
-            I_total = I_motor + Icap
-            V_new = Vth_phase - Z_th * I_total
-            if abs(V_new - V) / max(abs(V), 1e-9) < 1e-7:
-                break
-            V = V_new
-        start_current_hv = abs(I_total)
-    else:
-        S_lr_kva = volt_sag.locked_rotor_kva(s.hp, s.motor_code)
-        if s.atl_model.upper() == "CONST_S":
-            S = S_lr_kva * 1000.0
-            if math.isfinite(i_start_limit_hv):
-                s_limit_va = volt_sag.SQRT3 * s.v_ll_hv * i_start_limit_hv
-                S = min(S, s_limit_va)
-            P = S * s.start_pf
-            Q = math.sqrt(max(S * S - P * P, 0.0))
-            Q_net = Q - Qcap_total_var
-            S3 = complex(P, Q_net)
-            V_load = volt_sag.two_bus_solve_constS(Vth_phase, Z_th, S3)
-            I_total = S3.conjugate() / (3.0 * V_load.conjugate())
-            start_current_hv = abs(I_total)
-        elif s.atl_model.upper() == "CONST_I":
-            I_lra_hv = (S_lr_kva * 1000.0) / (volt_sag.SQRT3 * s.v_ll_hv)
-            I_mag = s.atl_I_multiplier_of_LRA * I_lra_hv
-            I_mag = min(I_mag, i_start_limit_hv)
-            pf = min(max(s.start_pf, 0.0), 1.0)
-            I_motor = complex(I_mag * pf, -I_mag * math.sqrt(max(1.0 - pf * pf, 0.0)))
-            V = Vth_phase
-            I_total = 0j
-            for _ in range(60):
-                Icap = complex(0.0, +Qcap_phase_var / max(abs(V), 1e-9))
-                I_total = I_motor + Icap
-                V_new = Vth_phase - Z_th * I_total
-                if abs(V_new - V) / max(abs(V), 1e-9) < 1e-7:
-                    break
-                V = V_new
-            start_current_hv = abs(I_total)
-        else:
-            raise ValueError("atl_model must be CONST_S or CONST_I")
+    # Start current — use converged load voltage to back-calculate feeder current
+    V_load = volt_sag.solve_load_voltage(s, Z_th, Vth_phase, _i_start_limit(s, max_start_kva))
+    start_current_hv = abs((Vth_phase - V_load) / Z_th)
 
     return start_current_hv, run_current_hv
 
@@ -267,7 +146,6 @@ def compute_sag_grid(
     for i, miles in enumerate(miles_vals):
         for j, hp in enumerate(hp_vals):
             s = replace(base, miles=float(miles), hp=float(hp))
-            # Flicker screening is based on magnitude of rapid voltage change (rise or sag).
             sag[i, j] = abs(sag_percent(s, z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva))
     return sag
 
@@ -283,14 +161,12 @@ def max_hp_under_threshold(
 ) -> float:
     sags = np.array(
         [
-            abs(
-                sag_percent(
-                    replace(base, miles=float(miles), hp=float(hp)),
-                    z_line_override=z_line_override,
-                    z_upstream_phase=z_upstream_phase,
-                    max_start_kva=max_start_kva,
-                )
-            )
+            abs(sag_percent(
+                replace(base, miles=float(miles), hp=float(hp)),
+                z_line_override=z_line_override,
+                z_upstream_phase=z_upstream_phase,
+                max_start_kva=max_start_kva,
+            ))
             for hp in hp_vals
         ]
     )
@@ -334,22 +210,17 @@ def overview_mode(
     )
     cbar = fig.colorbar(im, ax=ax, label="Start sag (%ΔV/V)")
 
-    # Risk classes overlay: green (ok), yellow (review), red (likely violation)
     overlay_levels = [0.0, review_pct, limit_pct, max(vmax, float(np.max(sag)) + 0.1)]
-    ax.contourf(
-        hp_vals,
-        miles_vals,
-        sag,
-        levels=overlay_levels,
-        colors=["#2ca02c", "#ffbf00", "#d62728"],
-        alpha=0.18,
-    )
-    c_review = ax.contour(hp_vals, miles_vals, sag, levels=[review_pct], colors=["#b8860b"], linestyles=["--"], linewidths=1.8)
-    c_limit = ax.contour(hp_vals, miles_vals, sag, levels=[limit_pct], colors=["#8b0000"], linestyles=["-"], linewidths=2.2)
+    ax.contourf(hp_vals, miles_vals, sag, levels=overlay_levels,
+                colors=["#2ca02c", "#ffbf00", "#d62728"], alpha=0.18)
+    c_review = ax.contour(hp_vals, miles_vals, sag, levels=[review_pct],
+                          colors=["#b8860b"], linestyles=["--"], linewidths=1.8)
+    c_limit = ax.contour(hp_vals, miles_vals, sag, levels=[limit_pct],
+                         colors=["#8b0000"], linestyles=["-"], linewidths=2.2)
     cbar.ax.text(1.6, 0.96, f"Review: {review_pct:.1f}%", transform=cbar.ax.transAxes, fontsize=8, va="top")
-    cbar.ax.text(1.6, 0.90, f"Limit: {limit_pct:.1f}%", transform=cbar.ax.transAxes, fontsize=8, va="top")
+    cbar.ax.text(1.6, 0.90, f"Limit: {limit_pct:.1f}%",  transform=cbar.ax.transAxes, fontsize=8, va="top")
     ax.clabel(c_review, fmt={review_pct: f"review {review_pct:.1f}%"}, inline=True, fontsize=8)
-    ax.clabel(c_limit, fmt={limit_pct: f"limit {limit_pct:.1f}%"}, inline=True, fontsize=8)
+    ax.clabel(c_limit,  fmt={limit_pct:  f"limit {limit_pct:.1f}%"},   inline=True, fontsize=8)
 
     ax.set_title(
         f"Overview: HP vs Miles | {base.start_mode.upper()} | xfmr={base.xfmr_kva:.0f} kVA | "
@@ -358,14 +229,9 @@ def overview_mode(
     )
     ax.set_xlabel("Motor size (HP)")
     ax.set_ylabel("Feeder miles (approx)")
-    ax.text(
-        0.01,
-        0.01,
-        "Heuristic: Yellow/Red regions should trigger engineering review.",
-        transform=ax.transAxes,
-        fontsize=9,
-        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"},
-    )
+    ax.text(0.01, 0.01, "Heuristic: Yellow/Red regions should trigger engineering review.",
+            transform=ax.transAxes, fontsize=9,
+            bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none"})
     return fig
 
 
@@ -379,6 +245,7 @@ def compare_mode(
     hp_scan_vals: Optional[np.ndarray] = None,
     z_upstream_phase: complex = 0j,
     max_start_kva: Optional[float] = None,
+    output_csv: Optional[str] = None,
 ) -> plt.Figure:
     limit_pct = allowable_dv_percent_mv(starts_per_hour)
     review_pct = review_fraction_of_limit * limit_pct
@@ -391,77 +258,53 @@ def compare_mode(
         dv_abs = abs(sag_signed)
         start_i_a, run_i_a = start_and_run_current_hv_amps(s, z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva)
         max_hp_no_review = max_hp_under_threshold(
-            replace(base, cond=cond),
-            selected_miles,
-            hp_scan_vals,
-            review_pct,
-            z_upstream_phase=z_upstream_phase,
-            max_start_kva=max_start_kva,
+            replace(base, cond=cond), selected_miles, hp_scan_vals, review_pct,
+            z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva,
         )
         max_hp_within_limit = max_hp_under_threshold(
-            replace(base, cond=cond),
-            selected_miles,
-            hp_scan_vals,
-            limit_pct,
-            z_upstream_phase=z_upstream_phase,
-            max_start_kva=max_start_kva,
+            replace(base, cond=cond), selected_miles, hp_scan_vals, limit_pct,
+            z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva,
         )
         s_limit = replace(base, cond=cond, hp=float(max_hp_within_limit), miles=float(selected_miles))
         limit_start_i_a, _ = start_and_run_current_hv_amps(
-            s_limit,
-            z_upstream_phase=z_upstream_phase,
-            max_start_kva=max_start_kva,
+            s_limit, z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva,
         )
         limit_start_kva = startup_kva_from_current(s_limit.v_ll_hv, limit_start_i_a)
 
-        if dv_abs >= limit_pct:
-            status = "LIKELY VIOLATION"
-        elif dv_abs >= review_pct:
-            status = "REVIEW"
-        else:
-            status = "OK"
-        if start_i_a >= ampacity_a or run_i_a >= ampacity_a:
-            loading_status = "AMPACITY EXCEEDED"
-        elif max(start_i_a, run_i_a) >= 0.9 * ampacity_a:
-            loading_status = "NEAR AMPACITY"
-        else:
-            loading_status = "WITHIN AMPACITY"
+        status = status_from_dv(dv_abs, review_pct, limit_pct)
+        loading_status = loading_status_from_currents(start_i_a, run_i_a, ampacity_a)
 
-        rows.append(
-            {
-                "conductor": label,
-                "sag_signed": sag_signed,
-                "dv_abs": dv_abs,
-                "margin": limit_pct - dv_abs,
-                "status": status,
-                "ampacity_a": ampacity_a,
-                "start_i_a": start_i_a,
-                "run_i_a": run_i_a,
-                "loading_status": loading_status,
-                "limit_start_i_a": limit_start_i_a,
-                "limit_start_kva": limit_start_kva,
-                "max_hp_no_review": max_hp_no_review,
-                "max_hp_within_limit": max_hp_within_limit,
-            }
-        )
+        rows.append({
+            "conductor": label,
+            "sag_signed": sag_signed,
+            "dv_abs": dv_abs,
+            "margin": limit_pct - dv_abs,
+            "status": status,
+            "ampacity_a": ampacity_a,
+            "start_i_a": start_i_a,
+            "run_i_a": run_i_a,
+            "loading_status": loading_status,
+            "limit_start_i_a": limit_start_i_a,
+            "limit_start_kva": limit_start_kva,
+            "max_hp_no_review": max_hp_no_review,
+            "max_hp_within_limit": max_hp_within_limit,
+        })
 
     rows.sort(key=lambda r: r["dv_abs"])
     labels = [r["conductor"] for r in rows]
     sag_vals = [r["dv_abs"] for r in rows]
     colors = [
-        "#d62728" if r["status"] == "LIKELY VIOLATION" else "#ffbf00" if r["status"] == "REVIEW" else "#2ca02c"
+        "#d62728" if r["status"] == "LIKELY VIOLATION"
+        else "#ffbf00" if r["status"] == "REVIEW"
+        else "#2ca02c"
         for r in rows
     ]
 
-    fig, (ax_bar, ax_table) = plt.subplots(
-        2,
-        1,
-        figsize=(10, 8),
-        gridspec_kw={"height_ratios": [2.2, 1.2]},
-    )
+    fig, (ax_bar, ax_table) = plt.subplots(2, 1, figsize=(10, 8),
+                                            gridspec_kw={"height_ratios": [2.2, 1.2]})
     ax_bar.barh(labels, sag_vals, color=colors)
     ax_bar.axvline(review_pct, color="#b8860b", linestyle="--", linewidth=1.8, label=f"Review {review_pct:.1f}%")
-    ax_bar.axvline(limit_pct, color="#8b0000", linestyle="-", linewidth=2.0, label=f"Limit {limit_pct:.1f}%")
+    ax_bar.axvline(limit_pct,  color="#8b0000", linestyle="-",  linewidth=2.0, label=f"Limit {limit_pct:.1f}%")
     ax_bar.set_xlabel("Predicted start |ΔV| (%V/V)")
     ax_bar.set_title(
         f"Compare at {selected_hp:.0f} HP, {selected_miles:.1f} mi | {base.start_mode.upper()} | "
@@ -490,19 +333,10 @@ def compare_mode(
         for r in rows
     ]
     col_labels = [
-        "Conductor",
-        "Signed ΔV %",
-        "|ΔV| %",
-        "Margin to Limit %",
-        "Flicker Status",
-        "Ampacity A",
-        "Start I A",
-        "Run I A",
-        "Loading Status",
-        "Max Start I A (Limit)",
-        "Max Start kVA (Limit)",
-        "Max HP (No Review)",
-        "Max HP (Within Limit)",
+        "Conductor", "Signed ΔV %", "|ΔV| %", "Margin to Limit %",
+        "Flicker Status", "Ampacity A", "Start I A", "Run I A",
+        "Loading Status", "Max Start I A (Limit)", "Max Start kVA (Limit)",
+        "Max HP (No Review)", "Max HP (Within Limit)",
     ]
     ax_table.axis("off")
     tbl = ax_table.table(cellText=table_data, colLabels=col_labels, loc="center")
@@ -510,17 +344,16 @@ def compare_mode(
     tbl.set_fontsize(8)
     tbl.scale(1, 1.3)
 
-    # Console output for quick screening use in engineering review workflow.
+    # Console output
     print("\n=== Engineering screening heuristic ===")
     print(f"Selected point: {selected_hp:.1f} HP @ {selected_miles:.2f} mi, mode={base.start_mode.upper()}")
     if selected_hp > float(hp_scan_vals[-1]):
-        print(f"Note: selected HP is above scan range ({hp_scan_vals[-1]:.0f} HP); Max HP columns are capped by scan range.")
+        print(f"Note: selected HP is above scan range ({hp_scan_vals[-1]:.0f} HP); Max HP columns are capped.")
     print(f"Review threshold: {review_pct:.2f}% |ΔV| (80% of limit), hard limit: {limit_pct:.2f}% |ΔV|")
     if max_start_kva is not None:
         print(f"User start cap active: {max_start_kva:.1f} kVA")
     print("Screening uses |ΔV| (magnitude of voltage change), not signed sag only.")
     print("If requested HP exceeds 'Max HP (No Review)', trigger detailed flicker review.")
-    print("Loading screen uses estimated HV current vs nominal conductor ampacity.")
     for r in rows:
         print(
             f'{r["conductor"]:>9}: signed={r["sag_signed"]:+5.2f}% | |ΔV|={r["dv_abs"]:5.2f}% | {r["status"]:<16} | '
@@ -529,6 +362,13 @@ def compare_mode(
             f'MaxStart@Limit={r["limit_start_i_a"]:6.1f}A ({r["limit_start_kva"]:7.1f} kVA) | '
             f'NoReview<= {r["max_hp_no_review"]:6.1f} HP | WithinLimit<= {r["max_hp_within_limit"]:6.1f} HP'
         )
+
+    if output_csv:
+        with open(output_csv, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"Results written to {output_csv}")
 
     return fig
 
@@ -660,9 +500,7 @@ def print_ascii_study(
             zx = cond.x_ohm_per_mile * miles
             segment_loading = loading_status_from_currents(start_i_a, run_i_a, ampacity_a)
             print(f"    - {label:8s}: {miles:6.3f} mi -> {zr:7.4f} + j{zx:7.4f} ohm")
-            print(
-                f"      ampacity={ampacity_a:.0f} A | Istart={start_i_a:.1f} A | Irun={run_i_a:.1f} A | {segment_loading}"
-            )
+            print(f"      ampacity={ampacity_a:.0f} A | Istart={start_i_a:.1f} A | Irun={run_i_a:.1f} A | {segment_loading}")
     else:
         print("    - (none entered, line impedance = 0)")
     print(
@@ -688,59 +526,39 @@ def custom_study_mode(
     z_upstream_phase: complex,
     segments: List[Tuple[str, Conductor, float, float]],
     max_start_kva: Optional[float] = None,
+    output_csv: Optional[str] = None,
 ) -> plt.Figure:
     z_line_total = line_impedance_from_segments(segments)
     s = replace(base, miles=0.0)
 
     limit_pct = allowable_dv_percent_mv(starts_per_hour)
     review_pct = 0.8 * limit_pct
-    sag_signed = sag_percent(
-        s,
-        z_line_override=z_line_total,
-        z_upstream_phase=z_upstream_phase,
-        max_start_kva=max_start_kva,
-    )
+    sag_signed = sag_percent(s, z_line_override=z_line_total, z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva)
     dv_abs = abs(sag_signed)
     status = status_from_dv(dv_abs, review_pct, limit_pct)
     start_i_a, run_i_a = start_and_run_current_hv_amps(
-        s,
-        z_line_override=z_line_total,
-        z_upstream_phase=z_upstream_phase,
-        max_start_kva=max_start_kva,
+        s, z_line_override=z_line_total, z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva,
     )
     color = "#d62728" if status == "LIKELY VIOLATION" else "#ffbf00" if status == "REVIEW" else "#2ca02c"
 
     max_hp_no_review = max_hp_under_threshold(
-        s,
-        0.0,
-        hp_scan_vals,
-        review_pct,
-        z_line_override=z_line_total,
-        z_upstream_phase=z_upstream_phase,
-        max_start_kva=max_start_kva,
+        s, 0.0, hp_scan_vals, review_pct,
+        z_line_override=z_line_total, z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva,
     )
     max_hp_within_limit = max_hp_under_threshold(
-        s,
-        0.0,
-        hp_scan_vals,
-        limit_pct,
-        z_line_override=z_line_total,
-        z_upstream_phase=z_upstream_phase,
-        max_start_kva=max_start_kva,
+        s, 0.0, hp_scan_vals, limit_pct,
+        z_line_override=z_line_total, z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva,
     )
     s_limit = replace(s, hp=float(max_hp_within_limit))
     limit_start_i_a, _ = start_and_run_current_hv_amps(
-        s_limit,
-        z_line_override=z_line_total,
-        z_upstream_phase=z_upstream_phase,
-        max_start_kva=max_start_kva,
+        s_limit, z_line_override=z_line_total, z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva,
     )
     limit_start_kva = startup_kva_from_current(s_limit.v_ll_hv, limit_start_i_a)
 
     fig, (ax_bar, ax_tbl) = plt.subplots(2, 1, figsize=(12, 9), gridspec_kw={"height_ratios": [1.45, 1.75]})
     ax_bar.barh(["Study case"], [dv_abs], color=[color], height=0.45)
     ax_bar.axvline(review_pct, color="#b8860b", linestyle="--", linewidth=1.8, label=f"Review {review_pct:.1f}%")
-    ax_bar.axvline(limit_pct, color="#8b0000", linestyle="-", linewidth=2.0, label=f"Limit {limit_pct:.1f}%")
+    ax_bar.axvline(limit_pct,  color="#8b0000", linestyle="-",  linewidth=2.0, label=f"Limit {limit_pct:.1f}%")
     ax_bar.set_xlim(0, max(limit_pct * 1.8, dv_abs * 1.15, 1.0))
     ax_bar.set_xlabel("Rapid voltage change |ΔV| (%)")
     ax_bar.set_title(
@@ -750,13 +568,7 @@ def custom_study_mode(
     )
     ax_bar.legend(loc="lower right")
     ax_bar.grid(axis="x", alpha=0.25)
-    ax_bar.text(
-        dv_abs,
-        0,
-        f"  signed ΔV={sag_signed:+.2f}%\n  status={status}",
-        va="center",
-        fontsize=9,
-    )
+    ax_bar.text(dv_abs, 0, f"  signed ΔV={sag_signed:+.2f}%\n  status={status}", va="center", fontsize=9)
 
     z_xfmr = volt_sag.z_from_pctz(s.v_ll_hv, s.xfmr_kva, s.xfmr_pct_z, s.xfmr_x_over_r)
     z_total = z_upstream_phase + z_xfmr + z_line_total
@@ -770,23 +582,23 @@ def custom_study_mode(
         segment_loading_text = wrapped_lines(segment_loading_rows, width=68)
     else:
         segment_loading_text = "(none)"
-    rows = [
-        ["Upstream Z (ohm/ph)", f"{z_upstream_phase.real:.4f} + j{z_upstream_phase.imag:.4f}"],
-        ["Transformer Z (ohm/ph)", f"{z_xfmr.real:.4f} + j{z_xfmr.imag:.4f}"],
-        ["Line Z total (ohm/ph)", f"{z_line_total.real:.4f} + j{z_line_total.imag:.4f}"],
-        ["Thevenin Z total (ohm/ph)", f"{z_total.real:.4f} + j{z_total.imag:.4f}"],
-        ["Start current (HV A)", f"{start_i_a:.1f}"],
-        ["Run current (HV A)", f"{run_i_a:.1f}"],
-        ["Segments", segment_text],
-        ["Segment loading", segment_loading_text],
+    tbl_rows = [
+        ["Upstream Z (ohm/ph)",             f"{z_upstream_phase.real:.4f} + j{z_upstream_phase.imag:.4f}"],
+        ["Transformer Z (ohm/ph)",           f"{z_xfmr.real:.4f} + j{z_xfmr.imag:.4f}"],
+        ["Line Z total (ohm/ph)",            f"{z_line_total.real:.4f} + j{z_line_total.imag:.4f}"],
+        ["Thevenin Z total (ohm/ph)",        f"{z_total.real:.4f} + j{z_total.imag:.4f}"],
+        ["Start current (HV A)",             f"{start_i_a:.1f}"],
+        ["Run current (HV A)",               f"{run_i_a:.1f}"],
+        ["Segments",                         segment_text],
+        ["Segment loading",                  segment_loading_text],
         ["Max start current @ limit (HV A)", f"{limit_start_i_a:.1f}"],
-        ["Max start kVA @ limit", f"{limit_start_kva:.1f}"],
-        ["Max HP (No Review)", f"{max_hp_no_review:.0f}"],
-        ["Max HP (Within Limit)", f"{max_hp_within_limit:.0f}"],
+        ["Max start kVA @ limit",            f"{limit_start_kva:.1f}"],
+        ["Max HP (No Review)",               f"{max_hp_no_review:.0f}"],
+        ["Max HP (Within Limit)",            f"{max_hp_within_limit:.0f}"],
     ]
     ax_tbl.axis("off")
     tbl = ax_tbl.table(
-        cellText=rows,
+        cellText=tbl_rows,
         colLabels=["Study Input / Output", "Value"],
         colWidths=[0.42, 0.42],
         loc="center",
@@ -794,8 +606,7 @@ def custom_study_mode(
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(10)
     tbl.scale(1, 1.55)
-    # Header row is 0; "Segments" and "Segment loading" rows are 7 and 8.
-    for row_idx in (7, 8):
+    for row_idx in (7, 8):  # "Segments" and "Segment loading" rows need extra height
         for col_idx in (0, 1):
             cell = tbl[(row_idx, col_idx)]
             cell.set_height(cell.get_height() * 1.7)
@@ -819,6 +630,16 @@ def custom_study_mode(
         user_max_start_kva=max_start_kva,
     )
 
+    if output_csv:
+        with open(output_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["field", "value"])
+            writer.writerows(tbl_rows)
+            writer.writerow(["sag_signed_%", f"{sag_signed:.4f}"])
+            writer.writerow(["dv_abs_%", f"{dv_abs:.4f}"])
+            writer.writerow(["status", status])
+        print(f"Results written to {output_csv}")
+
     return fig
 
 
@@ -826,96 +647,32 @@ def main():
     parser = argparse.ArgumentParser(
         description="Motor flicker screening with overview and compare modes."
     )
-    parser.add_argument("--motor-hp", type=float, default=200.0, help="Selected motor size for compare mode.")
-    parser.add_argument("--miles", type=float, default=7.0, help="Selected feeder miles for compare mode.")
-    parser.add_argument(
-        "--start-tech",
-        type=str,
-        default="ATL",
-        help="Starting technology: ATL, SoftStart, or VFD.",
-    )
-    parser.add_argument("--starts-per-hour", type=float, default=4.0, help="Expected starts per hour.")
-    parser.add_argument(
-        "--cap-kvar",
-        type=float,
-        default=0.0,
-        help="Nearby 3-phase capacitor bank size in kVAr (0 if none).",
-    )
-    parser.add_argument("--xfmr-kva", type=float, default=500.0, help="Transformer kVA.")
-    parser.add_argument("--xfmr-pct-z", type=float, default=5.75, help="Transformer percent impedance.")
-    parser.add_argument("--xfmr-xr", type=float, default=10.0, help="Transformer X/R ratio.")
-    parser.add_argument(
-        "--max-start-kva",
-        type=float,
-        default=None,
-        help="Optional startup cap at PCC in kVA (leave unset for TBD/no cap).",
-    )
-    parser.add_argument(
-        "--upstream-r-ohm",
-        type=float,
-        default=0.0,
-        help="Upstream Thevenin resistance (ohm/phase on MV side). Default 0.0.",
-    )
-    parser.add_argument(
-        "--upstream-x-ohm",
-        type=float,
-        default=0.0,
-        help="Upstream Thevenin reactance (ohm/phase on MV side). Default 0.0.",
-    )
-    parser.add_argument(
-        "--hp-max",
-        type=float,
-        default=10000.0,
-        help="Maximum HP used for overview/threshold scan ranges.",
-    )
-    parser.add_argument(
-        "--prompt",
-        action="store_true",
-        help="Prompt for selected motor HP, miles, and start technology at runtime.",
-    )
-    parser.add_argument(
-        "--case-study",
-        action="store_true",
-        help="Run one custom feeder study (segment miles + upstream Z) instead of comparison mode.",
-    )
-    parser.add_argument(
-        "--study",
-        action="store_true",
-        help="Alias for --case-study.",
-    )
-    parser.add_argument(
-        "--print-env",
-        action="store_true",
-        help="Print Python/OS/package versions and exit.",
-    )
+    parser.add_argument("--motor-hp",       type=float, default=200.0,  help="Selected motor size for compare mode.")
+    parser.add_argument("--miles",          type=float, default=7.0,    help="Selected feeder miles for compare mode.")
+    parser.add_argument("--start-tech",     type=str,   default="ATL",  help="Starting technology: ATL, SoftStart, or VFD.")
+    parser.add_argument("--starts-per-hour",type=float, default=4.0,    help="Expected starts per hour.")
+    parser.add_argument("--cap-kvar",       type=float, default=0.0,    help="Nearby 3-phase capacitor bank size in kVAr (0 if none).")
+    parser.add_argument("--xfmr-kva",       type=float, default=500.0,  help="Transformer kVA.")
+    parser.add_argument("--xfmr-pct-z",     type=float, default=5.75,   help="Transformer percent impedance.")
+    parser.add_argument("--xfmr-xr",        type=float, default=10.0,   help="Transformer X/R ratio.")
+    parser.add_argument("--max-start-kva",  type=float, default=None,   help="Optional startup cap at PCC in kVA (leave unset for TBD/no cap).")
+    parser.add_argument("--upstream-r-ohm", type=float, default=0.0,    help="Upstream Thevenin resistance (ohm/phase on MV side).")
+    parser.add_argument("--upstream-x-ohm", type=float, default=0.0,    help="Upstream Thevenin reactance (ohm/phase on MV side).")
+    parser.add_argument("--hp-max",         type=float, default=10000.0, help="Maximum HP used for overview/threshold scan ranges.")
+    parser.add_argument("--output",         type=str,   default=None,   help="Optional path to write CSV results (compare or custom study).")
+    parser.add_argument("--prompt",    action="store_true", help="Prompt for selected motor HP, miles, and start technology at runtime.")
+    parser.add_argument("--case-study", action="store_true", help="Run one custom feeder study (segment miles + upstream Z).")
+    parser.add_argument("--study",      action="store_true", help="Alias for --case-study.")
+    parser.add_argument("--print-env",  action="store_true", help="Print Python/OS/package versions and exit.")
     args = parser.parse_args()
 
     if args.print_env:
         print_environment_info()
         return
 
-    # ---- sweep ranges for overview and screening interpolation ----
     hp_max = max(args.hp_max, 50.0)
     hp_vals = np.linspace(5, hp_max, 100)
-    miles_vals = np.linspace(0.1, 12.0, 80)
     hp_scan_vals = np.linspace(5, hp_max, 220)
-
-    # ---- scenario defaults ----
-    base = Scenario(
-        hp=50.0,
-        motor_code="K",                  # try G/H/J/K
-        miles=7.0,
-        cond=Conductor(1.367, 0.581),    # #2 ACSR approx
-        xfmr_kva=500.0,
-        xfmr_pct_z=5.75,
-        xfmr_x_over_r=10.0,
-        start_mode="ATL",                # "ATL" or "VFD"
-        atl_model="CONST_I",
-        start_pf=0.25,
-        atl_I_multiplier_of_LRA=1.0,
-        vfd_i_limit_pu_fla=1.30,
-        cap_kvar=0.0,
-    )
 
     selected_hp = args.motor_hp
     selected_miles = args.miles
@@ -941,9 +698,9 @@ def main():
             selected_cap_kvar = prompt_or_default_float("Capacitor bank size (kVAr, 3-phase total)", default_kvar)
         else:
             selected_cap_kvar = 0.0
-        selected_xfmr_kva = prompt_or_default_float("Transformer size (kVA)", selected_xfmr_kva)
-        selected_xfmr_pct_z = prompt_or_default_float("Transformer percent impedance (%Z)", selected_xfmr_pct_z)
-        selected_xfmr_xr = prompt_or_default_float("Transformer X/R", selected_xfmr_xr)
+        selected_xfmr_kva    = prompt_or_default_float("Transformer size (kVA)", selected_xfmr_kva)
+        selected_xfmr_pct_z  = prompt_or_default_float("Transformer percent impedance (%Z)", selected_xfmr_pct_z)
+        selected_xfmr_xr     = prompt_or_default_float("Transformer X/R", selected_xfmr_xr)
         max_start_default = "TBD" if selected_max_start_kva is None else f"{selected_max_start_kva:.1f}"
         max_start_raw = prompt_or_default_text("Max start kVA cap (enter number or TBD)", max_start_default)
         selected_max_start_kva = parse_optional_kva(max_start_raw)
@@ -952,19 +709,30 @@ def main():
 
     selected_start_tech = parse_start_tech(selected_start_tech)
     z_upstream_phase = complex(upstream_r_ohm, upstream_x_ohm)
-    review_fraction_of_limit = 0.8
 
-    # ---- mode 1: one map + risk overlay ----
-    # Use #2 ACSR as baseline conductor for map view; apply selected start technology.
+    base = Scenario(
+        hp=50.0,
+        motor_code="K",
+        miles=7.0,
+        cond=Conductor(1.367, 0.581),
+        xfmr_kva=500.0,
+        xfmr_pct_z=5.75,
+        xfmr_x_over_r=10.0,
+        start_mode="ATL",
+        atl_model="CONST_I",
+        start_pf=0.25,
+        atl_I_multiplier_of_LRA=1.0,
+        vfd_i_limit_pu_fla=1.30,
+        cap_kvar=0.0,
+    )
+
     overview_base = apply_start_tech(
-        replace(
-            base,
-            cond=CONDUCTOR_VARIANTS[3][1],
-            cap_kvar=selected_cap_kvar,
-            xfmr_kva=selected_xfmr_kva,
-            xfmr_pct_z=selected_xfmr_pct_z,
-            xfmr_x_over_r=selected_xfmr_xr,
-        ),
+        replace(base,
+                cond=CONDUCTOR_VARIANTS[3][1],
+                cap_kvar=selected_cap_kvar,
+                xfmr_kva=selected_xfmr_kva,
+                xfmr_pct_z=selected_xfmr_pct_z,
+                xfmr_x_over_r=selected_xfmr_xr),
         selected_start_tech,
     )
 
@@ -977,30 +745,34 @@ def main():
             z_upstream_phase=z_upstream_phase,
             segments=segments,
             max_start_kva=selected_max_start_kva,
+            output_csv=args.output,
         )
     else:
+        # Extend miles range so the selected point is always visible on the heatmap
+        miles_max = max(12.0, selected_miles * 1.25)
+        miles_vals = np.linspace(0.1, miles_max, 80)
+
         overview_mode(
             base=overview_base,
             hp_vals=hp_vals,
             miles_vals=miles_vals,
             starts_per_hour=starts_per_hour,
-            review_fraction_of_limit=review_fraction_of_limit,
+            review_fraction_of_limit=0.8,
             vmax=6.0,
             z_upstream_phase=z_upstream_phase,
             max_start_kva=selected_max_start_kva,
         )
-
-        # ---- mode 2: one point + conductor comparison + ranked table ----
         compare_mode(
             base=overview_base,
             conductor_variants=CONDUCTOR_VARIANTS,
             selected_hp=selected_hp,
             selected_miles=selected_miles,
             starts_per_hour=starts_per_hour,
-            review_fraction_of_limit=review_fraction_of_limit,
+            review_fraction_of_limit=0.8,
             hp_scan_vals=hp_scan_vals,
             z_upstream_phase=z_upstream_phase,
             max_start_kva=selected_max_start_kva,
+            output_csv=args.output,
         )
 
     plt.show()
