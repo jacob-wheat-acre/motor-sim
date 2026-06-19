@@ -93,6 +93,79 @@ def _i_start_limit(s: Scenario, max_start_kva: Optional[float]) -> float:
     return math.inf
 
 
+# ---------------------------------------------------------------------------
+# Minimum starting voltage (NEMA MG1 §12.44: ≥ 85 % rated V at motor terminals)
+# ---------------------------------------------------------------------------
+
+def start_voltage_pu(sag_signed_pct: float) -> float:
+    """Per-unit motor terminal voltage during a start event."""
+    return 1.0 - sag_signed_pct / 100.0
+
+
+def start_voltage_status(v_pu: float) -> str:
+    if v_pu >= 0.85:
+        return "OK"
+    if v_pu >= 0.80:
+        return "MARGINAL (<85%)"
+    return "AT RISK (<80%)"
+
+
+# ---------------------------------------------------------------------------
+# IEEE 519-2022 analytical harmonic screen (VFD / 6-pulse only)
+# ---------------------------------------------------------------------------
+
+# TDD limits from IEEE 519-2022 Table 2 (120 V–69 kV systems).
+_IEEE519_TDD_LIMITS: List[Tuple[float, float]] = [
+    (20.0,   5.0),
+    (50.0,   8.0),
+    (100.0, 12.0),
+    (1000.0, 15.0),
+    (math.inf, 20.0),
+]
+
+
+def ieee519_tdd_limit(isc_il: float) -> float:
+    """Return the IEEE 519-2022 TDD limit (%) for a given ISC/IL ratio."""
+    for threshold, limit in _IEEE519_TDD_LIMITS:
+        if isc_il < threshold:
+            return limit
+    return 20.0
+
+
+def ieee519_check(
+    s: Scenario,
+    Z_th: complex,
+    Vth_phase: complex,
+) -> Optional[dict]:
+    """
+    Analytical 6-pulse harmonic screen for VFD mode.
+    Returns None for non-VFD scenarios.
+
+    Not a substitute for a harmonic load-flow study — use as a first-pass
+    screening flag only. Assumes worst-case 6-pulse front end without a
+    line reactor (TDD ≈ 29 %).  A 3 % line reactor typically reduces TDD
+    to ≈ 14–18 %; an 18-pulse or active front end to < 5 %.
+    """
+    if s.start_mode.upper() != "VFD":
+        return None
+
+    i_sc = abs(Vth_phase) / max(abs(Z_th), 1e-12)
+    fla_lv = volt_sag.estimate_fla(s.hp, s.v_ll_lv, s.run_eff, s.run_pf)
+    i_l = fla_lv * (s.v_ll_lv / s.v_ll_hv)
+    isc_il = i_sc / max(i_l, 1e-12)
+    tdd_limit = ieee519_tdd_limit(isc_il)
+    typical_tdd = 29.0  # 6-pulse, no line reactor (conservative)
+
+    return {
+        "isc_hv_a": i_sc,
+        "il_hv_a": i_l,
+        "isc_il_ratio": isc_il,
+        "tdd_limit_pct": tdd_limit,
+        "typical_6pulse_tdd_pct": typical_tdd,
+        "screen_result": "REVIEW" if typical_tdd > tdd_limit else "OK",
+    }
+
+
 def sag_percent(
     s: Scenario,
     z_line_override: Optional[complex] = None,
@@ -273,6 +346,8 @@ def compare_mode(
 
         status = status_from_dv(dv_abs, review_pct, limit_pct)
         loading_status = loading_status_from_currents(start_i_a, run_i_a, ampacity_a)
+        v_pu = start_voltage_pu(sag_signed)
+        v_status = start_voltage_status(v_pu)
 
         rows.append({
             "conductor": label,
@@ -280,6 +355,8 @@ def compare_mode(
             "dv_abs": dv_abs,
             "margin": limit_pct - dv_abs,
             "status": status,
+            "v_start_pu": v_pu,
+            "v_start_status": v_status,
             "ampacity_a": ampacity_a,
             "start_i_a": start_i_a,
             "run_i_a": run_i_a,
@@ -321,22 +398,22 @@ def compare_mode(
             f'{r["dv_abs"]:.2f}',
             f'{r["margin"]:+.2f}',
             r["status"],
+            f'{r["v_start_pu"]:.3f}',
+            r["v_start_status"],
             f'{r["ampacity_a"]:.0f}',
             f'{r["start_i_a"]:.0f}',
             f'{r["run_i_a"]:.0f}',
             r["loading_status"],
-            f'{r["limit_start_i_a"]:.0f}',
-            f'{r["limit_start_kva"]:.0f}',
             f'{r["max_hp_no_review"]:.0f}',
             f'{r["max_hp_within_limit"]:.0f}',
         ]
         for r in rows
     ]
     col_labels = [
-        "Conductor", "Signed ΔV %", "|ΔV| %", "Margin to Limit %",
-        "Flicker Status", "Ampacity A", "Start I A", "Run I A",
-        "Loading Status", "Max Start I A (Limit)", "Max Start kVA (Limit)",
-        "Max HP (No Review)", "Max HP (Within Limit)",
+        "Conductor", "Signed ΔV %", "|ΔV| %", "Margin %",
+        "Flicker", "V_start pu", "Min-V Status",
+        "Amp A", "Start I A", "Run I A",
+        "Loading", "Max HP (Review)", "Max HP (Limit)",
     ]
     ax_table.axis("off")
     tbl = ax_table.table(cellText=table_data, colLabels=col_labels, loc="center")
@@ -357,11 +434,27 @@ def compare_mode(
     for r in rows:
         print(
             f'{r["conductor"]:>9}: signed={r["sag_signed"]:+5.2f}% | |ΔV|={r["dv_abs"]:5.2f}% | {r["status"]:<16} | '
+            f'V_start={r["v_start_pu"]:.3f}pu {r["v_start_status"]:<17} | '
             f'Istart={r["start_i_a"]:6.1f}A | Irun={r["run_i_a"]:6.1f}A | '
             f'amp={r["ampacity_a"]:6.1f}A | {r["loading_status"]:<17} | '
             f'MaxStart@Limit={r["limit_start_i_a"]:6.1f}A ({r["limit_start_kva"]:7.1f} kVA) | '
             f'NoReview<= {r["max_hp_no_review"]:6.1f} HP | WithinLimit<= {r["max_hp_within_limit"]:6.1f} HP'
         )
+
+    # IEEE 519 harmonic screen (VFD mode only)
+    if base.start_mode.upper() == "VFD":
+        s_check = replace(base, hp=float(selected_hp), miles=float(selected_miles),
+                          cond=CONDUCTOR_VARIANTS[0][1])  # use heaviest conductor for screen
+        Z_th, Vth = _thevenin(s_check, None, z_upstream_phase)
+        h = ieee519_check(s_check, Z_th, Vth)
+        if h:
+            print(
+                f"\n=== IEEE 519-2022 Harmonic Screen (analytical, 6-pulse VFD) ===\n"
+                f"  ISC (study bus) = {h['isc_hv_a']:.1f} A HV  |  IL (FLA) = {h['il_hv_a']:.2f} A HV\n"
+                f"  ISC/IL = {h['isc_il_ratio']:.1f}  →  TDD limit = {h['tdd_limit_pct']:.0f}%\n"
+                f"  Typical 6-pulse (no reactor) TDD ≈ {h['typical_6pulse_tdd_pct']:.0f}%  →  {h['screen_result']}\n"
+                f"  Note: add 3% line reactor to reduce TDD to ~15%; 18-pulse or AFE to <5%."
+            )
 
     if output_csv:
         with open(output_csv, "w", newline="") as f:
@@ -380,11 +473,11 @@ def parse_start_tech(raw: str) -> str:
     return START_TECH_ALIASES[key]
 
 
-def apply_start_tech(base: Scenario, start_tech: str) -> Scenario:
+def apply_start_tech(base: Scenario, start_tech: str, soft_start_factor: float = 0.5) -> Scenario:
     if start_tech == "ATL":
         return replace(base, start_mode="ATL", atl_I_multiplier_of_LRA=1.0)
     if start_tech == "SOFTSTART":
-        return replace(base, start_mode="ATL", atl_I_multiplier_of_LRA=0.5)
+        return replace(base, start_mode="ATL", atl_I_multiplier_of_LRA=soft_start_factor)
     if start_tech == "VFD":
         return replace(base, start_mode="VFD", atl_I_multiplier_of_LRA=1.0)
     raise ValueError("unsupported start technology")
@@ -512,7 +605,9 @@ def print_ascii_study(
         print(f"  User-applied startup cap: {user_max_start_kva:.1f} kVA")
     else:
         print("  User-applied startup cap: TBD (none applied)")
+    v_pu = start_voltage_pu(sag_signed)
     print(f"  Result: signed ΔV={sag_signed:+.2f}%  |ΔV|={dv_abs:.2f}%  status={status}")
+    print(f"  Motor terminal voltage during start: {v_pu:.3f} pu  →  {start_voltage_status(v_pu)}")
     print(
         f"  Utility-facing startup cap (@ hard limit): max start current={limit_start_i_a:.1f} A, "
         f"max start kVA={limit_start_kva:.1f} kVA (equivalent motor size ~{max_hp_within_limit:.0f} HP)"
@@ -582,6 +677,8 @@ def custom_study_mode(
         segment_loading_text = wrapped_lines(segment_loading_rows, width=68)
     else:
         segment_loading_text = "(none)"
+    v_pu = start_voltage_pu(sag_signed)
+    h519 = ieee519_check(s, z_total, complex(s.v_ll_hv / volt_sag.SQRT3, 0.0))
     tbl_rows = [
         ["Upstream Z (ohm/ph)",             f"{z_upstream_phase.real:.4f} + j{z_upstream_phase.imag:.4f}"],
         ["Transformer Z (ohm/ph)",           f"{z_xfmr.real:.4f} + j{z_xfmr.imag:.4f}"],
@@ -589,6 +686,7 @@ def custom_study_mode(
         ["Thevenin Z total (ohm/ph)",        f"{z_total.real:.4f} + j{z_total.imag:.4f}"],
         ["Start current (HV A)",             f"{start_i_a:.1f}"],
         ["Run current (HV A)",               f"{run_i_a:.1f}"],
+        ["V_start (pu)",                     f"{v_pu:.3f}  →  {start_voltage_status(v_pu)}"],
         ["Segments",                         segment_text],
         ["Segment loading",                  segment_loading_text],
         ["Max start current @ limit (HV A)", f"{limit_start_i_a:.1f}"],
@@ -596,6 +694,12 @@ def custom_study_mode(
         ["Max HP (No Review)",               f"{max_hp_no_review:.0f}"],
         ["Max HP (Within Limit)",            f"{max_hp_within_limit:.0f}"],
     ]
+    if h519:
+        tbl_rows.append([
+            "IEEE 519 TDD screen",
+            f"ISC/IL={h519['isc_il_ratio']:.1f}  limit={h519['tdd_limit_pct']:.0f}%"
+            f"  6-pulse≈{h519['typical_6pulse_tdd_pct']:.0f}%  →  {h519['screen_result']}"
+        ])
     ax_tbl.axis("off")
     tbl = ax_tbl.table(
         cellText=tbl_rows,
@@ -606,7 +710,7 @@ def custom_study_mode(
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(10)
     tbl.scale(1, 1.55)
-    for row_idx in (7, 8):  # "Segments" and "Segment loading" rows need extra height
+    for row_idx in (8, 9):  # "Segments" and "Segment loading" rows need extra height
         for col_idx in (0, 1):
             cell = tbl[(row_idx, col_idx)]
             cell.set_height(cell.get_height() * 1.7)
@@ -659,7 +763,9 @@ def main():
     parser.add_argument("--upstream-r-ohm", type=float, default=0.0,    help="Upstream Thevenin resistance (ohm/phase on MV side).")
     parser.add_argument("--upstream-x-ohm", type=float, default=0.0,    help="Upstream Thevenin reactance (ohm/phase on MV side).")
     parser.add_argument("--hp-max",         type=float, default=10000.0, help="Maximum HP used for overview/threshold scan ranges.")
-    parser.add_argument("--output",         type=str,   default=None,   help="Optional path to write CSV results (compare or custom study).")
+    parser.add_argument("--output",            type=str,   default=None,   help="Optional path to write CSV results (compare or custom study).")
+    parser.add_argument("--soft-start-factor", type=float, default=0.5,
+                        help="LRA multiplier used for SoftStart mode (default 0.5 = 50%% of LRA).")
     parser.add_argument("--prompt",    action="store_true", help="Prompt for selected motor HP, miles, and start technology at runtime.")
     parser.add_argument("--case-study", action="store_true", help="Run one custom feeder study (segment miles + upstream Z).")
     parser.add_argument("--study",      action="store_true", help="Alias for --case-study.")
@@ -734,6 +840,7 @@ def main():
                 xfmr_pct_z=selected_xfmr_pct_z,
                 xfmr_x_over_r=selected_xfmr_xr),
         selected_start_tech,
+        soft_start_factor=args.soft_start_factor,
     )
 
     if use_case_study:
