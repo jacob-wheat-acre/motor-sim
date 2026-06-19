@@ -263,7 +263,6 @@ def overview_mode(
     miles_vals: np.ndarray,
     starts_per_hour: float = 4.0,
     review_fraction_of_limit: float = 0.8,
-    vmax: float = 6.0,
     z_upstream_phase: complex = 0j,
     max_start_kva: Optional[float] = None,
 ) -> plt.Figure:
@@ -271,6 +270,9 @@ def overview_mode(
     review_pct = review_fraction_of_limit * limit_pct
     sag = compute_sag_grid(base, hp_vals, miles_vals, z_upstream_phase=z_upstream_phase, max_start_kva=max_start_kva)
 
+    # Scale colormap to the actual data so the review/limit contours are visible
+    # even when sags are large. Cap at 4× the hard limit to keep contrast useful.
+    effective_vmax = max(limit_pct * 4.0, float(np.percentile(sag, 95)))
     fig, ax = plt.subplots(figsize=(10, 5.5))
     im = ax.imshow(
         sag,
@@ -278,12 +280,12 @@ def overview_mode(
         aspect="auto",
         extent=[hp_vals.min(), hp_vals.max(), miles_vals.min(), miles_vals.max()],
         vmin=0.0,
-        vmax=vmax,
+        vmax=effective_vmax,
         cmap="viridis",
     )
     cbar = fig.colorbar(im, ax=ax, label="Start sag (%ΔV/V)")
 
-    overlay_levels = [0.0, review_pct, limit_pct, max(vmax, float(np.max(sag)) + 0.1)]
+    overlay_levels = [0.0, review_pct, limit_pct, max(effective_vmax, float(np.max(sag)) + 0.1)]
     ax.contourf(hp_vals, miles_vals, sag, levels=overlay_levels,
                 colors=["#2ca02c", "#ffbf00", "#d62728"], alpha=0.18)
     c_review = ax.contour(hp_vals, miles_vals, sag, levels=[review_pct],
@@ -377,8 +379,8 @@ def compare_mode(
         for r in rows
     ]
 
-    fig, (ax_bar, ax_table) = plt.subplots(2, 1, figsize=(10, 8),
-                                            gridspec_kw={"height_ratios": [2.2, 1.2]})
+    fig, (ax_bar, ax_table) = plt.subplots(2, 1, figsize=(15, 8),
+                                            gridspec_kw={"height_ratios": [2.2, 1.4]})
     ax_bar.barh(labels, sag_vals, color=colors)
     ax_bar.axvline(review_pct, color="#b8860b", linestyle="--", linewidth=1.8, label=f"Review {review_pct:.1f}%")
     ax_bar.axvline(limit_pct,  color="#8b0000", linestyle="-",  linewidth=2.0, label=f"Limit {limit_pct:.1f}%")
@@ -865,7 +867,6 @@ def main():
             miles_vals=miles_vals,
             starts_per_hour=starts_per_hour,
             review_fraction_of_limit=0.8,
-            vmax=6.0,
             z_upstream_phase=z_upstream_phase,
             max_start_kva=selected_max_start_kva,
         )
